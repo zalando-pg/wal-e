@@ -6,12 +6,15 @@ import itertools
 import json
 import os
 import sys
+import tarfile
+import tempfile
 
 from io import BytesIO
 from wal_e import log_help
 from wal_e import storage
 from wal_e import tar_partition
 from wal_e.exception import UserException, UserCritical
+from wal_e.tar_partition import ExtendedTarInfo, TarPartition
 from wal_e.worker import prefetch
 from wal_e.worker import (WalSegment,
                           WalUploader,
@@ -109,7 +112,7 @@ class Backup(object):
                 if not os.path.isfile(restore_spec):
                     raise UserException(
                         msg='Restore specification does not exist',
-                        detail='File not found: %s'.format(restore_spec),
+                        detail='File not found: {0}'.format(restore_spec),
                         hint=('Provide valid json-formatted restoration '
                               'specification, or pseudo-name "SOURCE" to '
                               'restore using the specification from the '
@@ -169,13 +172,15 @@ class Backup(object):
         backup_stop_good = False
         while_offline = False
         start_backup_info = None
+        conn = None
         if 'while_offline' in kwargs:
             while_offline = kwargs.pop('while_offline')
 
         try:
             if not while_offline:
-                start_backup_info = PgBackupStatements.run_start_backup()
-                version = PgBackupStatements.pg_version()['version']
+                conn = PgBackupStatements()
+                start_backup_info = conn.run_start_backup()
+                version = conn.pg_version()['version']
             else:
                 if os.path.exists(os.path.join(data_directory,
                                                'postmaster.pid')):
@@ -206,7 +211,8 @@ class Backup(object):
                             'See README: TODO about pg_cancel_backup'))
 
             if not while_offline:
-                stop_backup_info = PgBackupStatements.run_stop_backup()
+                stop_backup_info = conn.run_stop_backup()
+                self._upload_backup_label(stop_backup_info['labelfile'], stop_backup_info['spcmapfile'])
             else:
                 stop_backup_info = start_backup_info
             backup_stop_good = True
@@ -489,21 +495,57 @@ class Backup(object):
         uploader = PartitionUploader(self.creds, backup_prefix,
                                      per_process_limit, self.gpg_key_id)
 
-        pool = TarUploadPool(uploader, pool_size)
+        self.pool = TarUploadPool(uploader, pool_size)
 
         # Enqueue uploads for parallel execution
         for tpart in parts:
+            self.last_part = tpart.name
             total_size += tpart.total_member_size
 
             # 'put' can raise an exception for a just-failed upload,
             # aborting the process.
-            pool.put(tpart)
+            self.pool.put(tpart)
 
         # Wait for remaining parts to upload.  An exception can be
         # raised to signal failure of the upload.
-        pool.join()
+        self.pool.join()
 
         return spec, backup_prefix, total_size
+
+    def _upload_backup_label(self, labelfile, spcmapfile):
+        tf = tempfile.NamedTemporaryFile(delete=False)
+        with tf:
+            tf.write(labelfile.encode('utf-8'))
+        labelfile = tf.name
+
+        bogus_tar = tarfile.TarFile(os.devnull, 'w', dereference=False)
+
+        et_info = ExtendedTarInfo(
+            tarinfo=bogus_tar.gettarinfo(labelfile, arcname='backup_label'),
+            submitted_path=labelfile)
+
+        partition = TarPartition(self.last_part + 1, [et_info])
+
+        if spcmapfile:
+            tf = tempfile.NamedTemporaryFile(delete=False)
+            with tf:
+                tf.write(spcmapfile.encode('utf-8'))
+            spcmapfile = tf.name
+
+            et_info = ExtendedTarInfo(
+                tarinfo=bogus_tar.gettarinfo(spcmapfile, arcname='tablespace_map'),
+                submitted_path=spcmapfile)
+            partition.append(et_info)
+
+        self.pool.closed = False
+        self.pool.put(partition)
+        self.pool.join()
+
+        bogus_tar.close()
+
+        os.unlink(labelfile)
+        if spcmapfile:
+            os.unlink(spcmapfile)
 
     def _exception_gather_guard(self, fn):
         """

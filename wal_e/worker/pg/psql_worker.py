@@ -1,13 +1,7 @@
-import csv
 import datetime
-import os
+import psycopg2
 
-from subprocess import PIPE
-
-from wal_e.piper import popen_nonblock
 from wal_e.exception import UserException
-
-PSQL_BIN = 'psql'
 
 
 class UTC(datetime.tzinfo):
@@ -31,82 +25,23 @@ class UTC(datetime.tzinfo):
         return self.ZERO
 
 
-def psql_csv_run(sql_command, error_handler=None):
-    """
-    Runs psql and returns a CSVReader object from the query
-
-    This CSVReader includes header names as the first record in all
-    situations.  The output is fully buffered into Python.
-
-    """
-    csv_query = ('COPY ({query}) TO STDOUT WITH CSV HEADER;'
-                 .format(query=sql_command))
-
-    new_env = os.environ.copy()
-    new_env.setdefault('PGOPTIONS', '')
-    new_env["PGOPTIONS"] += ' --statement-timeout=0'
-    psql_proc = popen_nonblock([PSQL_BIN, '-d', 'postgres', '--no-password',
-                                '--no-psqlrc', '-c', csv_query],
-                               stdout=PIPE,
-                               env=new_env)
-    stdout = psql_proc.communicate()[0].decode('utf-8')
-
-    if psql_proc.returncode != 0:
-        if error_handler is not None:
-            error_handler(psql_proc)
-        else:
-            assert error_handler is None
-            raise UserException(
-                'could not csv-execute a query successfully via psql',
-                'Query was "{query}".'.format(sql_command),
-                'You may have to set some libpq environment '
-                'variables if you are sure the server is running.')
-
-    # Previous code must raise any desired exceptions for non-zero
-    # exit codes
-    assert psql_proc.returncode == 0
-
-    # Fake enough iterator interface to get a CSV Reader object
-    # that works.
-    return csv.reader(iter(stdout.strip().split('\n')))
-
-
 class PgBackupStatements(object):
     """
     Contains operators to start and stop a backup on a Postgres server
 
-    Relies on PsqlHelp for underlying mechanism.
-
     """
 
-    _WAL_NAME = None  # Lazy set to 'wal' or 'xlog' depending on version
+    def __init__(self):
+        self._conn = psycopg2.connect(dbname='postgres')
+        self._conn.autocommit = True
+        with self._conn.cursor() as cur:
+            cur.execute('SET statement_timeout=0')
 
-    @staticmethod
-    def _dict_transform(csv_reader):
-        rows = list(csv_reader)
-        assert len(rows) == 2, 'Expect header row and data row'
-        return dict(list(zip(*rows)))
+    @property
+    def _wal_name(self):
+        return 'wal' if self._conn.server_version >= 100000 else 'xlog'
 
-    @classmethod
-    def _wal_name(cls):
-        """
-        Sets and returns _WAL_NAME to 'wal' or 'xlog' depending on
-        version of postgres we are working with.
-
-        It is used for handling xlog -> wal rename in postgres v10
-
-        """
-        if cls._WAL_NAME is None:
-            version = cls._dict_transform(psql_csv_run(
-                    "SELECT current_setting('server_version_num')"))
-            if int(version['current_setting']) >= 100000:
-                cls._WAL_NAME = 'wal'
-            else:
-                cls._WAL_NAME = 'xlog'
-        return cls._WAL_NAME
-
-    @classmethod
-    def run_start_backup(cls):
+    def run_start_backup(self):
         """
         Connects to a server and attempts to start a hot backup
 
@@ -114,9 +49,6 @@ class PgBackupStatements(object):
         recording.
 
         """
-        def handler(popen):
-            assert popen.returncode != 0
-            raise UserException('Could not start hot backup')
 
         # The difficulty of getting a timezone-stamped, UTC,
         # ISO-formatted datetime is downright embarrassing.
@@ -125,15 +57,16 @@ class PgBackupStatements(object):
         label = 'freeze_start_' + (datetime.datetime.utcnow()
                                    .replace(tzinfo=UTC()).isoformat())
 
-        return cls._dict_transform(psql_csv_run(
-                "SELECT file_name, "
-                "  lpad(file_offset::text, 8, '0') AS file_offset "
-                "FROM pg_{0}file_name_offset("
-                "  pg_start_backup('{1}'))".format(cls._wal_name(), label),
-                error_handler=handler))
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(("SELECT file_name, lpad(file_offset::text, 8, '0') AS file_offset"
+                             " FROM pg_{0}file_name_offset(pg_start_backup(%s, false, false))")
+                            .format(self._wal_name), (label,))
+                return dict(list(zip(['file_name', 'file_offset'], cur.fetchone())))
+        except Exception:
+            raise UserException('Could not start hot backup')
 
-    @classmethod
-    def run_stop_backup(cls):
+    def run_stop_backup(self):
         """
         Stop a hot backup, if it was running, or error
 
@@ -141,19 +74,17 @@ class PgBackupStatements(object):
         gain consistency on the captured heap.
 
         """
-        def handler(popen):
-            assert popen.returncode != 0
+
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(("SELECT file_name, lpad(file_offset::text, 8, '0') AS file_offset,"
+                             " labelfile, spcmapfile FROM (SELECT (pg_{0}file_name_offset(lsn)).*,"
+                             " labelfile, spcmapfile FROM pg_stop_backup(false)) a").format(self._wal_name))
+                return dict(list(zip(['file_name', 'file_offset', 'labelfile', 'spcmapfile'], cur.fetchone())))
+        except Exception:
             raise UserException('Could not stop hot backup')
 
-        return cls._dict_transform(psql_csv_run(
-                "SELECT file_name, "
-                "  lpad(file_offset::text, 8, '0') AS file_offset "
-                "FROM pg_{0}file_name_offset("
-                "  pg_stop_backup())".format(cls._wal_name()),
-                error_handler=handler))
-
-    @classmethod
-    def pg_version(cls):
+    def pg_version(self):
         """
         Get a very informative version string from Postgres
 
@@ -161,4 +92,6 @@ class PgBackupStatements(object):
         other details.
 
         """
-        return cls._dict_transform(psql_csv_run('SELECT * FROM version()'))
+        with self._conn.cursor() as cur:
+            cur.execute('SELECT * FROM version()')
+            return dict(list(zip(['version'], cur.fetchone())))

@@ -73,7 +73,6 @@ from wal_e.exception import UserCritical
 from wal_e.exception import UserException
 from wal_e import storage
 from wal_e.piper import popen_sp
-from wal_e.worker.pg import PSQL_BIN, psql_csv_run
 from wal_e.pipeline import LZOP_BIN, PV_BIN, GPG_BIN
 from wal_e.worker.pg import CONFIG_BIN, PgControlDataParser
 
@@ -84,7 +83,7 @@ logger = log_help.WalELogger('wal_e.main')
 
 
 def external_program_check(
-    to_check=frozenset([PSQL_BIN, LZOP_BIN, PV_BIN])):
+    to_check=frozenset([LZOP_BIN, PV_BIN])):
     """
     Validates the existence and basic working-ness of other programs
 
@@ -100,36 +99,23 @@ def external_program_check(
     could_not_run = []
     error_msgs = []
 
-    def psql_err_handler(popen):
-        assert popen.returncode != 0
-        error_msgs.append(textwrap.fill(
-                'Could not get a connection to the database: '
-                'note that superuser access is required'))
-
-        # Bogus error message that is re-caught and re-raised
-        raise EnvironmentError('INTERNAL: Had problems running psql '
-                               'from external_program_check')
-
     with open(os.devnull, 'wb') as nullf:
         for program in to_check:
             try:
-                if program is PSQL_BIN:
-                    psql_csv_run('SELECT 1', error_handler=psql_err_handler)
+                if program is PV_BIN:
+                    extra_args = ['--quiet']
                 else:
-                    if program is PV_BIN:
-                        extra_args = ['--quiet']
-                    else:
-                        extra_args = []
+                    extra_args = []
 
-                    proc = popen_sp([program] + extra_args,
-                                    stdout=nullf, stderr=nullf,
-                                    stdin=subprocess.PIPE)
+                proc = popen_sp([program] + extra_args,
+                                stdout=nullf, stderr=nullf,
+                                stdin=subprocess.PIPE)
 
-                    # Close stdin for processes that default to
-                    # reading from the pipe; the programs WAL-E uses
-                    # of this kind will terminate in this case.
-                    proc.stdin.close()
-                    proc.wait()
+                # Close stdin for processes that default to
+                # reading from the pipe; the programs WAL-E uses
+                # of this kind will terminate in this case.
+                proc.stdin.close()
+                proc.wait()
             except EnvironmentError:
                 could_not_run.append(program)
 
@@ -633,7 +619,7 @@ def main():
                     PV_BIN,
                     controldata_bin]
             else:
-                external_programs = [LZOP_BIN, PSQL_BIN, PV_BIN]
+                external_programs = [LZOP_BIN, PV_BIN]
 
             external_program_check(external_programs)
             rate_limit = args.rate_limit
