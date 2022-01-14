@@ -54,9 +54,8 @@ def uri_put_file(creds, uri, fp, content_type=None, conn=None):
     if content_type is not None:
         k.content_type = content_type
 
-    storage_class = os.getenv('WALE_S3_STORAGE_CLASS', 'STANDARD')
-    k.set_contents_from_file(fp, encrypt_key=True,
-                             headers={"x-amz-storage-class": storage_class})
+    disable_encryption = str(os.getenv('WALE_DISABLE_S3_SSE')).lower() == 'true'
+    k.set_contents_from_file(fp, encrypt_key=(not disable_encryption))
     return k
 
 
