@@ -59,9 +59,14 @@ class PgBackupStatements(object):
 
         try:
             with self._conn.cursor() as cur:
-                cur.execute(("SELECT file_name, lpad(file_offset::text, 8, '0') AS file_offset"
-                             " FROM pg_{0}file_name_offset(pg_start_backup(%s, false, false))")
-                            .format(self._wal_name), (label,))
+                if self._conn.server_version >= 150000:
+                    cur.execute(("SELECT file_name, lpad(file_offset::text, 8, '0') AS file_offset"
+                                " FROM pg_{0}file_name_offset(pg_backup_start(%s, false))")
+                                .format(self._wal_name), (label,))
+                else:
+                    cur.execute(("SELECT file_name, lpad(file_offset::text, 8, '0') AS file_offset"
+                                " FROM pg_{0}file_name_offset(pg_start_backup(%s, false, false))")
+                                .format(self._wal_name), (label,))
                 return dict(list(zip(['file_name', 'file_offset'], cur.fetchone())))
         except Exception:
             raise UserException('Could not start hot backup')
@@ -77,9 +82,14 @@ class PgBackupStatements(object):
 
         try:
             with self._conn.cursor() as cur:
-                cur.execute(("SELECT file_name, lpad(file_offset::text, 8, '0') AS file_offset,"
-                             " labelfile, spcmapfile FROM (SELECT (pg_{0}file_name_offset(lsn)).*,"
-                             " labelfile, spcmapfile FROM pg_stop_backup(false)) a").format(self._wal_name))
+                if self._conn.server_version >= 150000:
+                    cur.execute(("SELECT file_name, lpad(file_offset::text, 8, '0') AS file_offset,"
+                                " labelfile, spcmapfile FROM (SELECT (pg_{0}file_name_offset(lsn)).*,"
+                                " labelfile, spcmapfile FROM pg_backup_stop()) a").format(self._wal_name))
+                else:
+                    cur.execute(("SELECT file_name, lpad(file_offset::text, 8, '0') AS file_offset,"
+                                " labelfile, spcmapfile FROM (SELECT (pg_{0}file_name_offset(lsn)).*,"
+                                " labelfile, spcmapfile FROM pg_stop_backup(false)) a").format(self._wal_name))
                 return dict(list(zip(['file_name', 'file_offset', 'labelfile', 'spcmapfile'], cur.fetchone())))
         except Exception:
             raise UserException('Could not stop hot backup')
