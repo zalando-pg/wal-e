@@ -10,10 +10,14 @@ import sys
 def gevent_monkey(*args, **kwargs):
     import gevent.monkey
     gevent.monkey.patch_os()
-    gevent.monkey.patch_thread()
     gevent.monkey.patch_socket(dns=True, aggressive=True)
     gevent.monkey.patch_ssl()
     gevent.monkey.patch_time()
+
+
+# Monkey-patch procedures early.  If it doesn't work with gevent,
+# sadly it cannot be used (easily) in WAL-E.
+gevent_monkey()
 
 
 def ssl_monkey():
@@ -58,6 +62,8 @@ def ssl_monkey():
 
     ssl.wrap_socket = wrap_socket_monkey
 
+
+ssl_monkey()
 
 import argparse
 import logging
@@ -710,8 +716,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # Monkey-patch procedures early.  If it doesn't work with gevent,
-    # sadly it cannot be used (easily) in WAL-E.
-    gevent_monkey()
-    ssl_monkey()
     main()
