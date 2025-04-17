@@ -1,3 +1,5 @@
+import os
+
 from boto import provider
 from functools import partial
 from wal_e.exception import UserException
@@ -19,6 +21,14 @@ class InstanceProfileProvider(provider.Provider):
 
     def get_credentials(self, access_key=None, secret_key=None,
                         security_token=None, profile_name=None):
+        
+        imds_url = os.environ.get('AWS_EC2_METADATA_SERVICE_ENDPOINT')
+        if imds_url:
+            from boto.utils import get_instance_metadata
+            func_args = list(get_instance_metadata.__defaults__)
+            func_args[1] = imds_url
+            get_instance_metadata.__defaults__ = tuple(func_args)
+        
         if self.MetadataServiceSupport[self.name]:
             self._populate_keys_from_metadata_server()
 
